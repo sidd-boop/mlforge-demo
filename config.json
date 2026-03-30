@@ -1,0 +1,7 @@
+{
+    "project": "mlforge-e2e-test",
+    "model_arch": "SGDClassifier",
+    "dataset": "iris",
+    "epochs": 6,
+    "loss": "log_loss"
+}
