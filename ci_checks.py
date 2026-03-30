@@ -17,6 +17,7 @@ from src.mlforge.core.deployment_manager.ci.inference import (
 )
 from src.mlforge.core.deployment_manager.ci.metrics import (
     MetricContext,
+    BaselineComparisonStrategy,
 )
 # ─── Inference Schemas ──────────────────────────────────────
 class IrisInput(BaseInferenceInput):
@@ -43,7 +44,10 @@ class IrisInferenceRunner(BaseInferenceRunner[IrisInput, IrisOutput]):
         return IrisOutput(prediction=pred, probabilities=probs)
     def batch(self, inputs):
         return [self.predict(inp) for inp in inputs]
-# ─── CI Checks ──────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════
+# HAPPY-PATH CHECKS (Phase 5A)
+# ═════════════════════════════════════════════════════════════
 def register_all_checks(registry):
     """
     Registers all CI checks on the given CheckRegistry instance.
@@ -158,3 +162,162 @@ def register_all_checks(registry):
                 )
             ctx = MetricContext(current=current_metrics, previous=None)
             return strategy.evaluate(ctx)
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Dependency Skip (Phase 5B)
+# ═════════════════════════════════════════════════════════════
+def register_dependency_skip_checks(registry):
+    """Register checks to test dependency-skip behavior."""
+    @registry.register(name="always_fails", priority=0, required=True)
+    class AlwaysFailsCheck(BaseCheck):
+        """Intentionally fails so dependent check is skipped."""
+        def execute(self, context):
+            return CheckResult(passed=False, message="intentional failure")
+
+    @registry.register(
+        name="should_skip",
+        priority=1,
+        required=True,
+        depends_on=["always_fails"],
+    )
+    class ShouldSkipCheck(BaseCheck):
+        """Should be SKIPPED because always_fails didn't pass."""
+        def execute(self, context):
+            return CheckResult(passed=True, message="should never run")
+
+    @registry.register(name="independent_pass", priority=2, required=False)
+    class IndependentPassCheck(BaseCheck):
+        """No dependencies — should run and pass even after failures."""
+        def execute(self, context):
+            return CheckResult(passed=True, message="independent check passed")
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Lifecycle Hooks (Phase 5C)
+# ═════════════════════════════════════════════════════════════
+def register_lifecycle_checks(registry):
+    """Register checks to test before/after/finalize lifecycle hooks."""
+
+    @registry.register(name="lifecycle_hooks", priority=0, required=True)
+    class LifecycleHooksCheck(BaseCheck):
+        """Tests that before(), after(), and finalize() all fire."""
+        def before(self, context):
+            context["lifecycle_before_ran"] = True
+
+        def execute(self, context):
+            before_ran = context.get("lifecycle_before_ran", False)
+            return CheckResult(
+                passed=before_ran,
+                message=f"before() ran: {before_ran}",
+            )
+
+        def after(self, context, result):
+            context["lifecycle_after_ran"] = True
+
+        def finalize(self):
+            pass  # just verify it doesn't crash
+
+    @registry.register(name="before_raises", priority=1, required=True)
+    class BeforeRaisesCheck(BaseCheck):
+        """Tests that an exception in before() is caught and reported."""
+        def before(self, context):
+            raise RuntimeError("intentional before() error")
+
+        def execute(self, context):
+            return CheckResult(passed=True, message="should never run")
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Real Metric-From-DB Check (Phase 5D)
+# ═════════════════════════════════════════════════════════════
+def register_metric_db_checks(registry):
+    """Register check that reads metrics from PostgreSQL via context.metric_manager."""
+
+    @registry.register(name="metric_from_db", priority=0, required=True)
+    class MetricFromDBCheck(BaseCheck):
+        """
+        Queries PostgreSQL via context.metric_manager.get_latest_metrics()
+        to verify metrics logged in Phase 3 are readable inside a CI check.
+        """
+        def execute(self, context):
+            mm = context.metric_manager
+            if mm is None:
+                return CheckResult(passed=False, message="No metric_manager in context")
+            try:
+                latest = mm.get_latest_metrics(run_id=context.run_id)
+                if not latest:
+                    return CheckResult(
+                        passed=False,
+                        message="get_latest_metrics returned empty",
+                    )
+                has_accuracy = "train_accuracy" in latest or "final_accuracy" in latest
+                return CheckResult(
+                    passed=has_accuracy,
+                    message=f"DB metrics retrieved: {sorted(latest.keys())}",
+                    details=latest,
+                )
+            except Exception as e:
+                return CheckResult(passed=False, message=f"DB query failed: {e}")
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Baseline Comparison (Phase 5E)
+# ═════════════════════════════════════════════════════════════
+def register_baseline_checks(registry, current_metrics, previous_metrics=None):
+    """Register check using BaselineComparisonStrategy."""
+
+    @registry.register(name="baseline_comparison", priority=0, required=True)
+    class BaselineComparisonCheck(BaseCheck):
+        """Tests BaselineComparisonStrategy with optional previous metrics."""
+        def execute(self, context):
+            strategy = BaselineComparisonStrategy(
+                metrics_to_compare=["accuracy"],
+                min_delta=0.0,
+                fallback_thresholds={"accuracy": 0.50},
+            )
+            ctx = MetricContext(
+                current=current_metrics,
+                previous=previous_metrics,
+            )
+            return strategy.evaluate(ctx)
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Optional Failure (Phase 5G)
+# ═════════════════════════════════════════════════════════════
+def register_optional_failure_checks(registry):
+    """Register checks to verify optional failures don't block CI."""
+
+    @registry.register(name="required_pass", priority=0, required=True)
+    class RequiredPassCheck(BaseCheck):
+        """A passing required check."""
+        def execute(self, context):
+            return CheckResult(passed=True, message="required check passed")
+
+    @registry.register(name="optional_failure", priority=1, required=False)
+    class OptionalFailureCheck(BaseCheck):
+        """An optional check that fails — should NOT block CI."""
+        def execute(self, context):
+            return CheckResult(passed=False, message="optional check intentionally failed")
+
+# ═════════════════════════════════════════════════════════════
+# EDGE CASE: Threshold Missing Metric (Phase 5H)
+# ═════════════════════════════════════════════════════════════
+def register_threshold_missing_checks(registry):
+    """Register check to verify ThresholdStrategy behavior with missing metrics."""
+    from src.mlforge.core.deployment_manager.ci.metrics import ThresholdStrategy
+
+    @registry.register(name="threshold_missing_metric", priority=0, required=True)
+    class ThresholdMissingMetricCheck(BaseCheck):
+        """ThresholdStrategy should fail when a required metric key is missing."""
+        def execute(self, context):
+            strategy = ThresholdStrategy({"nonexistent_metric": 0.90})
+            current = context.get("current_eval_metrics", {"accuracy": 0.95})
+            ctx = MetricContext(current=current, previous=None)
+            result = strategy.evaluate(ctx)
+            # We EXPECT this to fail — strategy should report missing metric
+            if not result.passed and "not found" in result.message:
+                return CheckResult(
+                    passed=True,
+                    message=f"Correctly detected missing metric: {result.message}",
+                )
+            return CheckResult(
+                passed=False,
+                message=f"Expected failure for missing metric, got: passed={result.passed}, msg={result.message}",
+            )

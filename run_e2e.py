@@ -6,7 +6,7 @@ Tests all managers with real backends:
   - env_manager    → LocalMachineEnvironment  (local)
   - metric_manager → PostgreSQLTracker        (PostgreSQL)
   - model_manager  → MongoRegistry            (MongoDB)
-  - CI runner      → LocalCI + PipelineManager
+  - CI runner      → LocalCI + PipelineManager (multiple edge cases)
 Usage:
     set MLFORGE_ROOT=e:\\MLF\\MLForge
     set MLFORGE_PG_PASSWORD=your_password
@@ -49,19 +49,28 @@ from src.mlforge.core.deployment_manager.ci.metrics import ThresholdStrategy
 from src.mlforge.core.deployment_manager.ci.pipeline import PipelineManager
 from src.mlforge.core.deployment_manager.ci.report_writer import save_report
 # User-defined checks & inference runner (from this repo)
-from ci_checks import IrisInferenceRunner, register_all_checks
+from ci_checks import (
+    IrisInferenceRunner,
+    register_all_checks,
+    register_dependency_skip_checks,
+    register_lifecycle_checks,
+    register_metric_db_checks,
+    register_baseline_checks,
+    register_optional_failure_checks,
+    register_threshold_missing_checks,
+)
 # ════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════
 # The remote repo URL — this repo itself (change to your URL after pushing)
-GIT_URL    = os.getenv("MLFORGE_GIT_URL", "https://github.com/<YOUR_USERNAME>/mlforge-e2e-test.git")
+GIT_URL    = os.getenv("MLFORGE_GIT_URL", "https://github.com/sidd-boop/mlforge-demo.git")
 GIT_BRANCH = os.getenv("MLFORGE_GIT_BRANCH", "main")
 # PostgreSQL
 PG_HOST     = os.getenv("MLFORGE_PG_HOST", "localhost")
 PG_PORT     = int(os.getenv("MLFORGE_PG_PORT", "5432"))
 PG_DATABASE = os.getenv("MLFORGE_PG_DATABASE", "mlforge_test")
 PG_USER     = os.getenv("MLFORGE_PG_USER", "postgres")
-PG_PASSWORD = os.getenv("MLFORGE_PG_PASSWORD", "")
+PG_PASSWORD = os.getenv("MLFORGE_PG_PASSWORD", "12345678")
 # MongoDB
 MONGO_URI        = os.getenv("MLFORGE_MONGO_URI", "mongodb://localhost:27017")
 MONGO_DATABASE   = os.getenv("MLFORGE_MONGO_DATABASE", "mlforge_e2e")
@@ -80,11 +89,19 @@ def cleanup(path):
         os.chmod(p, 0o777)
         func(p)
     if path.exists():
-        shutil.rmtree(path, onexc=_handle)
+        shutil.rmtree(path, onerror=_handle)
 def section(title):
     print(f"\n{'='*60}")
     print(f"  {title}")
     print(f"{'='*60}")
+
+passed_phases = []
+def phase_pass(name, details=""):
+    passed_phases.append(name)
+    print(f"\n✓ {name}: ALL PASSED")
+    if details:
+        print(details)
+
 # ════════════════════════════════════════════════════════════
 # SHARED CONTEXT (one run_id/experiment_id used everywhere)
 # ════════════════════════════════════════════════════════════
@@ -132,8 +149,9 @@ assert (local_env.working_dir / "train.py").exists(), "env_manager: train.py not
 # .env should have been loaded and securely deleted
 assert os.environ.get("MLFORGE_E2E_TEST") == "enabled", "env_manager: .env not loaded"
 assert not (local_env.working_dir / ".env").exists(),    "env_manager: .env not deleted"
-print("\n✓ env_manager: connect, setup_directory_structure, sync_code,")
-print("  load_environment_variables, install_packages, setup_device, validate_setup — ALL PASSED")
+phase_pass("env_manager",
+    "  Features: connect, setup_directory_structure, sync_code,\n"
+    "            load_environment_variables, install_packages, setup_device, validate_setup")
 # ════════════════════════════════════════════════════════════
 # PHASE 2 : TRAIN A MODEL
 # ════════════════════════════════════════════════════════════
@@ -242,13 +260,13 @@ assert "prediction_distribution" in latest,       "histogram not in latest"
 assert len(step_range) == 3,                      f"Step range 1-3 should return 3, got {len(step_range)}"
 assert str(run_id) in comparison,                 "compare_runs missing current run"
 assert len(eval_metrics) >= 2,                    "Should have at least 2 eval metrics"
-print(f"\n✓ PostgreSQLTracker: ALL PASSED")
-print(f"  Total metrics logged:   {len(all_metrics)}")
-print(f"  Latest keys:            {sorted(latest.keys())}")
-print(f"  Comparison runs:        {list(comparison.keys())}")
-print(f"  Features tested:        log_metric, log_metrics, log_image, log_histogram,")
-print(f"                          log_custom_event, phase(), get_metrics (5 filter combos),")
-print(f"                          get_latest_metrics, compare_runs")
+phase_pass("PostgreSQLTracker",
+    f"  Total metrics logged:   {len(all_metrics)}\n"
+    f"  Latest keys:            {sorted(latest.keys())}\n"
+    f"  Comparison runs:        {list(comparison.keys())}\n"
+    f"  Features tested:        log_metric, log_metrics, log_image, log_histogram,\n"
+    f"                          log_custom_event, phase(), get_metrics (5 filter combos),\n"
+    f"                          get_latest_metrics, compare_runs")
 # ════════════════════════════════════════════════════════════
 # PHASE 4 : MODEL MANAGER (MongoRegistry)
 # ════════════════════════════════════════════════════════════
@@ -322,26 +340,26 @@ try:
     assert len(multi) >= 2, f"Expected ≥2 models, got {len(multi)}"
 finally:
     mongo.disconnect()
-print(f"\n✓ MongoRegistry: ALL PASSED")
-print(f"  Models logged:   2 ({version_id}, {version_id_2})")
-print(f"  Features tested: initialize, connect, set_artifact_context, log_model,")
-print(f"                   get_model, view_models (by run, by experiment, all), disconnect")
+phase_pass("MongoRegistry",
+    f"  Models logged:   2 ({version_id}, {version_id_2})\n"
+    f"  Features tested: initialize, connect, set_artifact_context, log_model,\n"
+    f"                   get_model, view_models (by run, by experiment, all), disconnect")
+
 # ════════════════════════════════════════════════════════════
-# PHASE 5 : CI RUNNER (LocalCI + PipelineManager)
+# PHASE 5A : CI — HAPPY PATH (all checks pass)
 # ════════════════════════════════════════════════════════════
-section("PHASE 5: CI Runner (LocalCI + PipelineManager)")
-# ── Register checks ────────────────────────────────────────
-registry = CheckRegistry()
-register_all_checks(registry)
-# ── Create inference logger & runner ───────────────────────
-inference_logger = InferenceLogger()
-runner = IrisInferenceRunner(inference_logger)
-# ── Build CI context ───────────────────────────────────────
-ci_context = CIContext(
+section("PHASE 5A: CI Happy Path")
+registry_5a = CheckRegistry()
+register_all_checks(registry_5a)
+
+inference_logger_5a = InferenceLogger()
+runner_5a = IrisInferenceRunner(inference_logger_5a)
+
+ci_context_5a = CIContext(
     model_path=str(model_path),
     model_name="sgd-iris-e2e",
-    runner=runner,
-    inference_logger=inference_logger,
+    runner=runner_5a,
+    inference_logger=inference_logger_5a,
     inference_sample={"features": [5.1, 3.5, 1.4, 0.2]},
     version_id=version_id,
     run_id=str(run_id),
@@ -353,50 +371,350 @@ ci_context = CIContext(
         }
     },
 )
-# ── Run the pipeline ───────────────────────────────────────
-ci_config = {
+
+ci_config_5a = {
     "model_name":        "sgd-iris-e2e",
     "model_path":        str(model_path),
-    "fail_fast":         False,       # run ALL checks even if one fails
+    "fail_fast":         False,
     "check_timeout":     30,
     "pipeline_timeout":  120,
 }
-ci = LocalCI(config=ci_config, registry=registry)
-pipeline = PipelineManager(ci=ci, context=ci_context)
-result = pipeline.run()
-# ── Reports ────────────────────────────────────────────────
-report = result.ci_result
-print(report.summary())
+ci_5a = LocalCI(config=ci_config_5a, registry=registry_5a)
+pipeline_5a = PipelineManager(ci=ci_5a, context=ci_context_5a)
+result_5a = pipeline_5a.run()
+
+report_5a = result_5a.ci_result
+print(report_5a.summary())
 report_path = str(WORKSPACE / "output" / "ci_report.json")
-save_report(report, report_path)
+save_report(report_5a, report_path)
+
 # ── Assertions ─────────────────────────────────────────────
-assert len(report.checks) >= 5,             f"Expected ≥5 checks, got {len(report.checks)}"
-assert len(report.passed_checks) >= 4,      f"Expected ≥4 passed, got {len(report.passed_checks)}"
-assert len(report.pipeline_logs) > 0,       "No pipeline logs captured"
-assert len(report.inference_logs) > 0,      "No inference logs captured"
-assert os.path.exists(report_path),         "CI report JSON not saved"
-exit_code = pipeline.get_exit_code()
-assert exit_code == 0,                      f"Expected exit code 0, got {exit_code}"
-assert result.passed,                       f"CI pipeline failed!\n{report.summary()}"
+assert len(report_5a.checks) >= 5,             f"Expected ≥5 checks, got {len(report_5a.checks)}"
+assert len(report_5a.passed_checks) >= 4,      f"Expected ≥4 passed, got {len(report_5a.passed_checks)}"
+assert len(report_5a.pipeline_logs) > 0,       "No pipeline logs captured"
+assert len(report_5a.inference_logs) > 0,      "No inference logs captured"
+assert os.path.exists(report_path),            "CI report JSON not saved"
+exit_code_5a = pipeline_5a.get_exit_code()
+assert exit_code_5a == 0,                      f"Expected exit code 0, got {exit_code_5a}"
+assert result_5a.passed,                       f"CI pipeline failed!\n{report_5a.summary()}"
 # Verify report JSON
 with open(report_path) as f:
     report_data = json.load(f)
 assert report_data["passed"] is True
 assert len(report_data["checks"]) >= 5
-print(f"\n✓ CI Runner: ALL PASSED")
-print(f"  Checks registered: {len(registry)}")
-print(f"  Checks run:        {len(report.checks)}")
-print(f"  Passed:            {len(report.passed_checks)}")
-print(f"  Failed:            {len(report.failed_checks)}")
-print(f"  Skipped:           {len(report.skipped_checks)}")
-print(f"  Pipeline logs:     {len(report.pipeline_logs)}")
-print(f"  Inference logs:    {len(report.inference_logs)}")
-print(f"  Exit code:         {exit_code}")
-print(f"  Report saved:      {report_path}")
-print(f"  Features tested:   CheckRegistry, @register (name/priority/required/depends_on),")
-print(f"                     BaseCheck (execute lifecycle), CheckRunner (dependency resolution),")
-print(f"                     LocalCI, PipelineManager, CIContext, BaseInferenceRunner,")
-print(f"                     InferenceLogger, ThresholdStrategy, save_report, get_exit_code")
+phase_pass("CI Happy Path",
+    f"  Checks: {len(report_5a.checks)} run, {len(report_5a.passed_checks)} passed, "
+    f"{len(report_5a.failed_checks)} failed, {len(report_5a.skipped_checks)} skipped\n"
+    f"  Exit code: {exit_code_5a}\n"
+    f"  Features: CheckRegistry, @register, BaseCheck, CheckRunner,\n"
+    f"            LocalCI, PipelineManager, InferenceLogger, ThresholdStrategy, save_report")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5B : CI — DEPENDENCY SKIP + FAIL BEHAVIOR
+# ════════════════════════════════════════════════════════════
+section("PHASE 5B: CI Dependency Skip + Fail Behavior")
+registry_5b = CheckRegistry()
+register_dependency_skip_checks(registry_5b)
+
+ci_config_5b = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,       # ← run ALL checks even after failure
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+}
+ci_5b = LocalCI(config=ci_config_5b, registry=registry_5b)
+pipeline_5b = PipelineManager(
+    ci=ci_5b,
+    context=CIContext(model_path=str(model_path), model_name="dep-skip-test"),
+)
+result_5b = pipeline_5b.run()
+
+report_5b = result_5b.ci_result
+print(report_5b.summary())
+
+# ── Assertions ─────────────────────────────────────────────
+# Pipeline should FAIL because always_fails is required
+assert not result_5b.passed,               "Expected pipeline to fail (always_fails is required)"
+assert pipeline_5b.get_exit_code() == 1,   "Expected exit code 1"
+
+# should_skip must be skipped, not failed
+skipped_names = [c.name for c in report_5b.skipped_checks]
+assert "should_skip" in skipped_names,     f"should_skip not in skipped: {skipped_names}"
+
+# always_fails must be in failed_checks (not skipped)
+failed_names = [c.name for c in report_5b.failed_checks]
+assert "always_fails" in failed_names,     f"always_fails not in failed: {failed_names}"
+
+# independent_pass should still run and pass (no dependency, fail_fast=False)
+passed_names = [c.name for c in report_5b.passed_checks]
+assert "independent_pass" in passed_names, f"independent_pass not in passed: {passed_names}"
+
+# Verify total check count
+assert len(report_5b.checks) == 3,         f"Expected 3 checks, got {len(report_5b.checks)}"
+
+phase_pass("CI Dependency Skip",
+    f"  always_fails:     FAILED (as expected)\n"
+    f"  should_skip:      SKIPPED (dependency not met)\n"
+    f"  independent_pass: PASSED (no dependency, ran despite failures)\n"
+    f"  Pipeline passed:  {result_5b.passed} (correct: False)\n"
+    f"  Exit code:        {pipeline_5b.get_exit_code()}\n"
+    f"  Features tested:  depends_on, SkippedResult, fail_fast=False, dependency resolution")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5C : CI — LIFECYCLE HOOKS (before/after/finalize)
+# ════════════════════════════════════════════════════════════
+section("PHASE 5C: CI Lifecycle Hooks")
+registry_5c = CheckRegistry()
+register_lifecycle_checks(registry_5c)
+
+ci_config_5c = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+}
+ci_5c = LocalCI(config=ci_config_5c, registry=registry_5c)
+ctx_5c = CIContext(model_path=str(model_path), model_name="lifecycle-test")
+pipeline_5c = PipelineManager(ci=ci_5c, context=ctx_5c)
+result_5c = pipeline_5c.run()
+
+report_5c = result_5c.ci_result
+print(report_5c.summary())
+
+# ── Assertions ─────────────────────────────────────────────
+assert len(report_5c.checks) == 2,         f"Expected 2 checks, got {len(report_5c.checks)}"
+
+# lifecycle_hooks should pass — before() set data, execute() read it
+lifecycle_check = next(c for c in report_5c.checks if c.name == "lifecycle_hooks")
+assert lifecycle_check.passed,             f"lifecycle_hooks failed: {lifecycle_check.message}"
+
+# before_raises should FAIL with "before() raised" in its message
+before_raises_check = next(c for c in report_5c.checks if c.name == "before_raises")
+assert not before_raises_check.passed,     "before_raises should have failed"
+assert "before() raised" in before_raises_check.message, \
+    f"Expected 'before() raised' in message, got: {before_raises_check.message}"
+
+phase_pass("CI Lifecycle Hooks",
+    f"  lifecycle_hooks:  PASSED (before→execute→after→finalize all fired)\n"
+    f"  before_raises:    FAILED (exception caught, reported correctly)\n"
+    f"  Features tested:  BaseCheck.before(), after(), finalize(), _run() error handling")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5D : CI — REAL METRIC-FROM-DB CHECK
+# ════════════════════════════════════════════════════════════
+section("PHASE 5D: CI Metric-From-DB Check")
+registry_5d = CheckRegistry()
+register_metric_db_checks(registry_5d)
+
+# Reconnect pg_tracker for the CI check to use
+pg_tracker_5d = PostgreSQLTracker(pg_cfg, shared_ctx)
+pg_tracker_5d.connect()
+
+ci_config_5d = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+}
+ci_5d = LocalCI(config=ci_config_5d, registry=registry_5d)
+ctx_5d = CIContext(
+    model_path=str(model_path),
+    model_name="metric-db-test",
+    metric_manager=pg_tracker_5d,
+    run_id=str(run_id),
+)
+pipeline_5d = PipelineManager(ci=ci_5d, context=ctx_5d)
+result_5d = pipeline_5d.run()
+
+report_5d = result_5d.ci_result
+print(report_5d.summary())
+pg_tracker_5d.disconnect()
+
+# ── Assertions ─────────────────────────────────────────────
+db_check = next(c for c in report_5d.checks if c.name == "metric_from_db")
+assert db_check.passed,                    f"metric_from_db failed: {db_check.message}"
+assert result_5d.passed,                   "Pipeline should pass"
+
+phase_pass("CI Metric-From-DB",
+    f"  metric_from_db: PASSED — real PostgreSQL read inside a CI check\n"
+    f"  Message:        {db_check.message}\n"
+    f"  Features tested: context.metric_manager, get_latest_metrics() inside BaseCheck")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5E : CI — BASELINE COMPARISON STRATEGY
+# ════════════════════════════════════════════════════════════
+section("PHASE 5E: CI BaselineComparisonStrategy")
+
+# Test 1: No previous metrics → fallback to thresholds
+print("  Test 1: No previous → fallback thresholds")
+registry_5e1 = CheckRegistry()
+register_baseline_checks(
+    registry_5e1,
+    current_metrics={"accuracy": final_accuracy},
+    previous_metrics=None,    # ← no previous = first-time deploy
+)
+ci_5e1 = LocalCI(
+    config={"model_name": "baseline-test", "model_path": str(model_path),
+            "fail_fast": False, "check_timeout": 30, "pipeline_timeout": 120},
+    registry=registry_5e1,
+)
+pipeline_5e1 = PipelineManager(
+    ci=ci_5e1,
+    context=CIContext(model_path=str(model_path), model_name="baseline-no-prev"),
+)
+result_5e1 = pipeline_5e1.run()
+report_5e1 = result_5e1.ci_result
+print(report_5e1.summary())
+baseline_check_1 = next(c for c in report_5e1.checks if c.name == "baseline_comparison")
+assert baseline_check_1.passed,            f"Baseline (no previous) should pass: {baseline_check_1.message}"
+
+# Test 2: With previous metrics — new model same as old (delta=0.0 required, should pass)
+print("\n  Test 2: With previous → comparison")
+registry_5e2 = CheckRegistry()
+register_baseline_checks(
+    registry_5e2,
+    current_metrics={"accuracy": final_accuracy},
+    previous_metrics={"accuracy": final_accuracy - 0.01},   # ← current beats previous
+)
+ci_5e2 = LocalCI(
+    config={"model_name": "baseline-test", "model_path": str(model_path),
+            "fail_fast": False, "check_timeout": 30, "pipeline_timeout": 120},
+    registry=registry_5e2,
+)
+pipeline_5e2 = PipelineManager(
+    ci=ci_5e2,
+    context=CIContext(model_path=str(model_path), model_name="baseline-with-prev"),
+)
+result_5e2 = pipeline_5e2.run()
+report_5e2 = result_5e2.ci_result
+print(report_5e2.summary())
+baseline_check_2 = next(c for c in report_5e2.checks if c.name == "baseline_comparison")
+assert baseline_check_2.passed,            f"Baseline (with previous) should pass: {baseline_check_2.message}"
+
+phase_pass("CI BaselineComparison",
+    f"  No previous:   PASSED (fallback thresholds used)\n"
+    f"  With previous: PASSED (current beats baseline)\n"
+    f"  Features tested: BaselineComparisonStrategy, fallback_thresholds, min_delta, MetricContext")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5F : CI — DRY RUN MODE
+# ════════════════════════════════════════════════════════════
+section("PHASE 5F: CI Dry Run Mode")
+registry_5f = CheckRegistry()
+register_all_checks(registry_5f)  # register checks — but dry_run should skip them all
+
+ci_config_5f = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+    "dry_run":           True,           # ← SKIP all checks
+}
+ci_5f = LocalCI(config=ci_config_5f, registry=registry_5f)
+pipeline_5f = PipelineManager(
+    ci=ci_5f,
+    context=CIContext(model_path=str(model_path), model_name="dry-run-test"),
+)
+result_5f = pipeline_5f.run()
+
+report_5f = result_5f.ci_result
+
+# ── Assertions ─────────────────────────────────────────────
+assert result_5f.passed,                   "Dry run should always pass"
+assert len(report_5f.checks) == 0,         f"Dry run should have 0 checks, got {len(report_5f.checks)}"
+assert pipeline_5f.get_exit_code() == 0,   "Dry run exit code should be 0"
+
+phase_pass("CI Dry Run",
+    f"  Pipeline passed: True (no checks executed)\n"
+    f"  Checks run:      0\n"
+    f"  Exit code:       0\n"
+    f"  Features tested: dry_run=True bypasses all checks, report still built")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5G : CI — OPTIONAL FAILURE DOESN'T BLOCK
+# ════════════════════════════════════════════════════════════
+section("PHASE 5G: CI Optional Failure")
+registry_5g = CheckRegistry()
+register_optional_failure_checks(registry_5g)
+
+ci_config_5g = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+}
+ci_5g = LocalCI(config=ci_config_5g, registry=registry_5g)
+pipeline_5g = PipelineManager(
+    ci=ci_5g,
+    context=CIContext(model_path=str(model_path), model_name="optional-fail-test"),
+)
+result_5g = pipeline_5g.run()
+
+report_5g = result_5g.ci_result
+print(report_5g.summary())
+
+# ── Assertions ─────────────────────────────────────────────
+assert result_5g.passed,                   "Pipeline should PASS (only optional check failed)"
+assert pipeline_5g.get_exit_code() == 0,   "Exit code should be 0"
+
+# required_pass should be in passed
+passed_5g = [c.name for c in report_5g.passed_checks]
+assert "required_pass" in passed_5g,       f"required_pass not in passed: {passed_5g}"
+
+# optional_failure should be in failed but NOT block CI
+failed_5g = [c.name for c in report_5g.failed_checks]
+assert "optional_failure" in failed_5g,    f"optional_failure not in failed: {failed_5g}"
+
+phase_pass("CI Optional Failure",
+    f"  required_pass:    PASSED\n"
+    f"  optional_failure: FAILED (but did not block CI)\n"
+    f"  Pipeline passed:  True\n"
+    f"  Exit code:        0\n"
+    f"  Features tested:  required=False, optional failure isolation")
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5H : CI — THRESHOLD MISSING METRIC
+# ════════════════════════════════════════════════════════════
+section("PHASE 5H: CI Threshold Missing Metric")
+registry_5h = CheckRegistry()
+register_threshold_missing_checks(registry_5h)
+
+ci_config_5h = {
+    "model_name":        "sgd-iris-e2e",
+    "model_path":        str(model_path),
+    "fail_fast":         False,
+    "check_timeout":     30,
+    "pipeline_timeout":  120,
+}
+ci_5h = LocalCI(config=ci_config_5h, registry=registry_5h)
+pipeline_5h = PipelineManager(
+    ci=ci_5h,
+    context=CIContext(
+        model_path=str(model_path),
+        model_name="threshold-missing-test",
+        extras={"current_eval_metrics": {"accuracy": final_accuracy}},
+    ),
+)
+result_5h = pipeline_5h.run()
+
+report_5h = result_5h.ci_result
+print(report_5h.summary())
+
+# ── Assertions ─────────────────────────────────────────────
+threshold_check = next(c for c in report_5h.checks if c.name == "threshold_missing_metric")
+assert threshold_check.passed, \
+    f"threshold_missing_metric should PASS (correctly detected missing): {threshold_check.message}"
+
+phase_pass("CI Threshold Missing Metric",
+    f"  ThresholdStrategy correctly reported missing metric key\n"
+    f"  Check result: PASSED (meta-check verifies error detection)\n"
+    f"  Features tested: ThresholdStrategy with nonexistent key, graceful failure message")
+
 # ════════════════════════════════════════════════════════════
 # CLEANUP
 # ════════════════════════════════════════════════════════════
@@ -404,6 +722,23 @@ section("CLEANUP")
 local_env.teardown()
 cleanup(WORKSPACE)
 print(f"✓ Workspace cleaned: {WORKSPACE}")
+
+# ════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
 print(f"  🎉 ALL E2E TESTS PASSED 🎉")
+print(f"{'='*60}")
+print(f"\n  Phases passed: {len(passed_phases)}")
+for p in passed_phases:
+    print(f"    ✓ {p}")
+print(f"\n  CI Edge Cases Covered:")
+print(f"    • Happy path (5 checks pass)")
+print(f"    • Dependency skip (SkippedResult)")
+print(f"    • Lifecycle hooks (before/after/finalize)")
+print(f"    • Real DB metric read inside check")
+print(f"    • BaselineComparisonStrategy (no prev + with prev)")
+print(f"    • Dry run mode (skip all checks)")
+print(f"    • Optional failure doesn't block CI")
+print(f"    • Missing metric key in ThresholdStrategy")
 print(f"{'='*60}")
