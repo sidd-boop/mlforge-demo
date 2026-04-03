@@ -8,14 +8,14 @@ A real user would write these to define:
 import os
 import numpy as np
 import joblib
-from src.mlforge.core.deployment_manager.ci.checks import BaseCheck
-from src.mlforge.core.deployment_manager.ci.results import CheckResult
-from src.mlforge.core.deployment_manager.ci.inference import (
+from mlforge.core.deployment_manager.ci.checks import BaseCheck
+from mlforge.core.deployment_manager.ci.results import CheckResult
+from mlforge.core.deployment_manager.ci.inference import (
     BaseInferenceRunner,
     BaseInferenceInput,
     BaseInferenceOutput,
 )
-from src.mlforge.core.deployment_manager.ci.metrics import (
+from mlforge.core.deployment_manager.ci.metrics import (
     MetricContext,
     BaselineComparisonStrategy,
 )

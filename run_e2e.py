@@ -59,6 +59,12 @@ from ci_checks import (
     register_optional_failure_checks,
     register_threshold_missing_checks,
 )
+from huggingface_cd import HuggingFaceCD
+from mlforge.core.deployment_manager.basecd import BaseCD
+from mlforge.core.deployment_manager.cd.gate import DeploymentGate
+from mlforge.core.deployment_manager.cd.deploy.huggingface_deploy import HuggingFaceDeployer
+from mlforge.core.deployment_manager.cd.strategies import AutoDeployStrategy
+from mlforge.core.deployment_manager.pipeline import CICDPipelineManager
 # ════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════
@@ -70,13 +76,14 @@ PG_HOST     = os.getenv("MLFORGE_PG_HOST", "localhost")
 PG_PORT     = int(os.getenv("MLFORGE_PG_PORT", "5432"))
 PG_DATABASE = os.getenv("MLFORGE_PG_DATABASE", "mlforge_test")
 PG_USER     = os.getenv("MLFORGE_PG_USER", "postgres")
-PG_PASSWORD = os.getenv("MLFORGE_PG_PASSWORD", "12345678")
+#PG_PASSWORD = os.getenv("MLFORGE_PG_PASSWORD", "")
 # MongoDB
 MONGO_URI        = os.getenv("MLFORGE_MONGO_URI", "mongodb://localhost:27017")
 MONGO_DATABASE   = os.getenv("MLFORGE_MONGO_DATABASE", "mlforge_e2e")
 MONGO_COLLECTION = f"models_e2e_{uuid4().hex[:8]}"   # unique per run to avoid conflicts
 # Workspace — fresh temp directory for env_manager
 WORKSPACE = Path(tempfile.mkdtemp(prefix="mlforge_e2e_"))
+#CD
 # ════════════════════════════════════════════════════════════
 # HELPERS
 # ════════════════════════════════════════════════════════════
@@ -191,6 +198,24 @@ artifact_db = ArtifactContextDB({
 })
 artifact_db.connect()
 try:
+    import psycopg2
+    try:
+        conn = psycopg2.connect(host=PG_HOST, port=PG_PORT, database=PG_DATABASE, user=PG_USER, password=PG_PASSWORD)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""
+                DO $$ DECLARE
+                    r RECORD;
+                BEGIN
+                    FOR r IN (SELECT oid::regprocedure as func FROM pg_proc WHERE proname IN ('get_artifact_context', 'get_contexts_by_user', 'upsert_artifact_context')) LOOP
+                        EXECUTE 'DROP FUNCTION IF EXISTS ' || r.func || ' CASCADE';
+                    END LOOP;
+                END $$;
+            """)
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Failed to drop functions: {e}")
+
     artifact_db.initialize_schema(os.path.join(MLFORGE_ROOT, "database", "schema.sql"))
     persisted = artifact_db.upsert_artifact_context(
         ArtifactContextCreate(
@@ -715,6 +740,95 @@ phase_pass("CI Threshold Missing Metric",
     f"  Check result: PASSED (meta-check verifies error detection)\n"
     f"  Features tested: ThresholdStrategy with nonexistent key, graceful failure message")
 
+section("PHASE 6: CD — HuggingFace Hub Deployment (Real)")
+
+#HF_TOKEN = os.environ.get("HF_TOKEN","")  #hf token
+#HF_REPO_ID = os.environ.get("HF_REPO_ID", "") #your own huggingface repo
+
+if not HF_TOKEN:
+    print("   HF_TOKEN not set — skipping Phase 6")
+else:
+    assert HF_REPO_ID, "HF_REPO_ID must be set (example: username/model-repo)"
+
+    registry_6 = CheckRegistry()
+    register_all_checks(registry_6)
+
+    inference_logger_6 = InferenceLogger()
+    runner_6 = IrisInferenceRunner(inference_logger_6)
+
+    ci_context_6 = CIContext(
+        model_path=str(model_path),
+        model_name="sgd-iris-hf",
+        runner=runner_6,
+        inference_logger=inference_logger_6,
+        inference_sample={"features": [5.1, 3.5, 1.4, 0.2]},
+        version_id=version_id,
+        run_id=str(run_id),
+        metric_strategy=ThresholdStrategy({"accuracy": 0.50}),
+        extras={
+            "current_eval_metrics": {
+                "accuracy": final_accuracy,
+                "num_classes": float(len(classes)),
+            }
+        },
+    )
+
+    ci_6 = LocalCI(
+        config={
+            "model_name": "sgd-iris-hf",
+            "model_path": str(model_path),
+            "fail_fast": False,
+            "check_timeout": 30,
+            "pipeline_timeout": 120,
+        },
+        registry=registry_6,
+    )
+
+    gate_6 = DeploymentGate.deploy_if(lambda new, old, ci_result: ci_result.passed)
+
+    deployer_6 = HuggingFaceDeployer(
+        repo_id=HF_REPO_ID,
+        token=HF_TOKEN,
+    )
+
+    cd_6 = HuggingFaceCD(
+        config={
+            "model_name": "sgd-iris-hf",
+            "model_path": str(model_dir),  # directory upload
+            "cd_timeout": 300,
+            "auto_rollback": True,
+            "dry_run": False,
+        },
+        gate=gate_6,
+        strategy=AutoDeployStrategy(),
+        deployer=deployer_6,
+    )
+
+    pipeline_6 = CICDPipelineManager(ci=ci_6, cd=cd_6, context=ci_context_6)
+    result_6 = pipeline_6.run()
+
+    print(result_6.summary())
+
+    assert result_6.ci_passed, f"CI should pass\n{result_6.ci_result.summary()}"
+    assert result_6.cd_result is not None, "CD result should not be None"
+    assert result_6.cd_result.gate_passed, "Gate should pass"
+    assert result_6.cd_deployed, f"Deployment failed: {result_6.cd_result.error}"
+    assert result_6.passed, "Overall pipeline should pass"
+    assert pipeline_6.get_exit_code() == 0, "Exit code should be 0"
+    assert result_6.cd_result.deploy_result is not None, "deploy_result should be populated"
+    assert result_6.cd_result.deploy_result.url == f"https://huggingface.co/{HF_REPO_ID}"
+    assert result_6.cd_result.strategy_used == "auto"
+
+    phase_pass(
+        "CD HuggingFace Hub",
+        f"  CI checks:    {len(result_6.ci_result.checks)} run\n"
+        f"  Gate:         PASSED\n"
+        f"  Strategy:     {result_6.cd_result.strategy_used}\n"
+        f"  Deployed:     {result_6.cd_deployed}\n"
+        f"  HF Repo URL:  {result_6.cd_result.deploy_result.url}\n"
+        f"  Commit:       {result_6.cd_result.deploy_result.metadata.get('commit', 'unknown')}\n"
+        f"  Exit code:    {pipeline_6.get_exit_code()}"
+    )
 # ════════════════════════════════════════════════════════════
 # CLEANUP
 # ════════════════════════════════════════════════════════════
@@ -741,4 +855,10 @@ print(f"    • BaselineComparisonStrategy (no prev + with prev)")
 print(f"    • Dry run mode (skip all checks)")
 print(f"    • Optional failure doesn't block CI")
 print(f"    • Missing metric key in ThresholdStrategy")
+print(f"\n  CD Covered:")
+print(f"    • HuggingFace Hub — real upload via huggingface_hub")
+print(f"    • Gate based on ci_result.passed")
+print(f"    • AutoDeployStrategy")
+print(f"    • Health check via HF API repo_info()")
+print(f"    • Rollback via super_squash_history()")
 print(f"{'='*60}")
